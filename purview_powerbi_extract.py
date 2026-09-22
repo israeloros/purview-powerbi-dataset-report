@@ -38,13 +38,20 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 
+# Microsoft Entra ID resource scope used to request Purview Data Map tokens.
 TOKEN_SCOPE = "https://purview.azure.net/.default"
+
+# Stable API version used by Purview Data Map discovery/search requests.
 DEFAULT_API_VERSION = "2023-09-01"
+
+# Known Power BI dataset type names, ordered from current to legacy variants.
 DEFAULT_DATASET_TYPES = (
     "powerbi_dataset",
     "azure_powerbi_dataset",
     "azure_pbi_dataset",
 )
+
+# Common Atlas relationships that can contain schemas, tables, or columns.
 SCHEMA_RELATIONSHIP_NAMES = {
     "schema",
     "schemas",
@@ -54,6 +61,7 @@ SCHEMA_RELATIONSHIP_NAMES = {
     "fields",
 }
 
+# Named logger used for progress, warnings, and actionable error messages.
 LOGGER = logging.getLogger("purview-powerbi-extract")
 
 
@@ -65,11 +73,22 @@ class PurviewApiError(RuntimeError):
 class Settings:
     """Resolved runtime configuration and optional service-principal values."""
 
+    # Base URL of the Purview account's Atlas/Data Map endpoint.
     endpoint: str
+
+    # API version appended to Data Map requests that require versioning.
     api_version: str
+
+    # Authentication strategy: auto, service-principal, or azure.
     auth_mode: str
+
+    # Optional service-principal directory identifier.
     tenant_id: str | None
+
+    # Optional service-principal application identifier.
     client_id: str | None
+
+    # Optional service-principal secret; used only to construct the credential.
     client_secret: str | None
 
 
