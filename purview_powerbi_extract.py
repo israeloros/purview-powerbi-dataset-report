@@ -1,5 +1,21 @@
 #!/usr/bin/env python3
-"""Export Power BI dataset schemas from Microsoft Purview Data Map."""
+"""Export Power BI semantic-model metadata from Microsoft Purview Data Map.
+
+The program performs four high-level operations:
+
+1. Load the Purview endpoint and authentication settings from command-line
+   arguments and an optional ``.env`` file.
+2. Authenticate with either a service principal or Azure Identity's default
+   credential chain.
+3. Search the Data Map for Power BI datasets and traverse their Atlas
+   relationships to schemas, tables, columns, and similar schema elements.
+4. Write the discovered hierarchy to JSON and a normalized representation to
+   CSV.
+
+Power BI entity type and relationship names can vary between Purview versions.
+The extractor therefore reads Atlas type definitions at runtime and combines
+their metadata with conservative naming heuristics.
+"""
 
 from __future__ import annotations
 
@@ -47,6 +63,8 @@ class PurviewApiError(RuntimeError):
 
 @dataclass(frozen=True)
 class Settings:
+    """Resolved runtime configuration and optional service-principal values."""
+
     endpoint: str
     api_version: str
     auth_mode: str
@@ -56,6 +74,12 @@ class Settings:
 
 
 def first_environment_value(*names: str) -> str | None:
+    """Return the first non-empty environment variable from ``names``.
+
+    Purview-specific variable names are passed before standard Azure Identity
+    names so callers can deliberately override shared Azure configuration.
+    """
+
     for name in names:
         value = os.getenv(name)
         if value:
@@ -64,6 +88,8 @@ def first_environment_value(*names: str) -> str | None:
 
 
 def normalize_endpoint(value: str) -> str:
+    """Normalize a Purview endpoint by adding HTTPS and removing a trailing slash."""
+
     endpoint = value.strip().rstrip("/")
     if not endpoint.startswith(("https://", "http://")):
         endpoint = f"https://{endpoint}"
@@ -71,6 +97,12 @@ def normalize_endpoint(value: str) -> str:
 
 
 def load_settings(args: argparse.Namespace) -> Settings:
+    """Load environment values and merge them with command-line arguments.
+
+    Explicit command-line endpoint values take precedence. The ``.env`` loader
+    does not overwrite variables already present in the process environment.
+    """
+
     if args.env_file:
         load_dotenv(args.env_file, override=False)
     else:
@@ -102,6 +134,14 @@ def load_settings(args: argparse.Namespace) -> Settings:
 
 
 def create_credential(settings: Settings) -> TokenCredential:
+    """Create the Azure credential selected by the configured authentication mode.
+
+    ``service-principal`` requires all three client-secret values. ``azure``
+    always uses :class:`DefaultAzureCredential`. ``auto`` prefers an explicitly
+    configured service principal and otherwise falls back to the Azure
+    credential chain.
+    """
+
     has_service_principal = all(
         (settings.tenant_id, settings.client_id, settings.client_secret)
     )
@@ -127,6 +167,8 @@ def create_credential(settings: Settings) -> TokenCredential:
 
 
 class PurviewAtlasClient:
+    """Small HTTP client for the Purview Data Map search and Atlas APIs."""
+
     def __init__(
         self,
         endpoint: str,
@@ -134,6 +176,8 @@ class PurviewAtlasClient:
         api_version: str = DEFAULT_API_VERSION,
         timeout: int = 60,
     ) -> None:
+        """Initialize a reusable HTTP session with transient-failure retries."""
+
         self.endpoint = endpoint.rstrip("/")
         self.credential = credential
         self.api_version = api_version
@@ -160,6 +204,17 @@ class PurviewAtlasClient:
         params: dict[str, Any] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Send an authenticated request and return its decoded JSON object.
+
+        A token is requested for every call. Azure Identity caches valid access
+        tokens internally, so this keeps token refresh handling centralized
+        without forcing a network token request for every API operation.
+
+        Raises:
+            PurviewApiError: If Purview returns a non-success HTTP status.
+            requests.RequestException: If the HTTP request itself fails.
+        """
+
         token = self.credential.get_token(TOKEN_SCOPE).token
         response = self.session.request(
             method,
@@ -188,6 +243,13 @@ class PurviewAtlasClient:
         return response.json()
 
     def get_type_definitions(self) -> dict[str, dict[str, Any]]:
+        """Return Atlas entity definitions indexed by type name.
+
+        Type definitions are cached because they are static for the duration of
+        an extraction and are consulted repeatedly during relationship
+        traversal.
+        """
+
         if self._type_definitions is None:
             response = self.request(
                 "GET",
@@ -202,6 +264,13 @@ class PurviewAtlasClient:
         return self._type_definitions
 
     def find_dataset_types(self, requested_types: list[str] | None) -> list[str]:
+        """Resolve Power BI dataset types from user input or Atlas definitions.
+
+        Automatic discovery searches names, display names, and descriptions for
+        both a Power BI marker and a dataset/semantic-model marker. Known type
+        names are used only as a fallback.
+        """
+
         definitions = self.get_type_definitions()
         if requested_types:
             missing = [name for name in requested_types if name not in definitions]
@@ -248,6 +317,12 @@ class PurviewAtlasClient:
     def search_entities(
         self, entity_type: str, page_size: int = 1000
     ) -> Iterable[dict[str, Any]]:
+        """Yield all active search results for an Atlas entity type.
+
+        Purview returns a continuation token when more results are available.
+        This generator follows that token until the final page.
+        """
+
         continuation_token: str | None = None
         while True:
             body: dict[str, Any] = {
@@ -269,6 +344,8 @@ class PurviewAtlasClient:
                 break
 
     def get_entity(self, guid: str) -> dict[str, Any]:
+        """Retrieve an entity, its relationships, and referred entities by GUID."""
+
         return self.request(
             "GET",
             f"/datamap/api/atlas/v2/entity/guid/{quote(guid, safe='')}",
@@ -281,6 +358,12 @@ class PurviewAtlasClient:
 
 
 def entity_summary(entity: dict[str, Any]) -> dict[str, Any]:
+    """Convert a full Atlas entity into the stable shape used in output files.
+
+    ``displayName`` is preferred because some Power BI entities store a URL in
+    ``name`` while exposing the human-readable asset name separately.
+    """
+
     attributes = entity.get("attributes") or {}
     excluded = {"name", "qualifiedName"}
     return {
@@ -303,6 +386,8 @@ def entity_summary(entity: dict[str, Any]) -> dict[str, Any]:
 
 
 def iter_entity_references(value: Any) -> Iterable[dict[str, Any]]:
+    """Recursively yield GUID-bearing entity references from relationship data."""
+
     if isinstance(value, list):
         for item in value:
             yield from iter_entity_references(item)
@@ -317,6 +402,13 @@ def iter_entity_references(value: Any) -> Iterable[dict[str, Any]]:
 def schema_relationship_names(
     entity: dict[str, Any], type_definitions: dict[str, dict[str, Any]]
 ) -> set[str]:
+    """Determine which relationships may contain schema elements.
+
+    The Atlas ``schemaElementsAttribute`` option is authoritative when present.
+    Common built-in names and schema-like relationship definitions provide
+    compatibility with Power BI and custom entity types that omit the option.
+    """
+
     names = set(SCHEMA_RELATIONSHIP_NAMES)
     definition = type_definitions.get(entity.get("typeName"), {})
     options = definition.get("options") or {}
@@ -335,6 +427,8 @@ def schema_relationship_names(
 
 
 def classify_schema_entity(entity: dict[str, Any], relationship_name: str) -> str:
+    """Classify an entity as a schema, table, column, or generic schema element."""
+
     type_name = str(entity.get("typeName", "")).lower()
     relationship_name = relationship_name.lower()
     if "column" in type_name or "field" in type_name or relationship_name in {
@@ -354,12 +448,23 @@ def classify_schema_entity(entity: dict[str, Any], relationship_name: str) -> st
 
 
 class SchemaExtractor:
+    """Build hierarchical dataset metadata by traversing Atlas relationships."""
+
     def __init__(self, client: PurviewAtlasClient) -> None:
+        """Initialize traversal state and load the account's type definitions."""
+
         self.client = client
         self.type_definitions = client.get_type_definitions()
         self.cache: dict[str, dict[str, Any]] = {}
 
     def get_entity(self, guid: str) -> dict[str, Any]:
+        """Return a complete entity while minimizing calls with a local cache.
+
+        Atlas entity responses commonly include complete tables and columns in
+        ``referredEntities``. Caching those objects allows a large semantic
+        model to be exported with only its initial dataset request.
+        """
+
         if guid not in self.cache:
             response = self.client.get_entity(guid)
             entity = response.get("entity")
@@ -379,6 +484,13 @@ class SchemaExtractor:
         relationship_name: str,
         ancestors: frozenset[str],
     ) -> dict[str, Any]:
+        """Recursively convert an entity and its schema relationships to a tree.
+
+        ``ancestors`` prevents malformed or bidirectional Atlas relationships
+        from creating recursion cycles. Child GUIDs are also deduplicated within
+        each parent.
+        """
+
         node = entity_summary(entity)
         node["kind"] = classify_schema_entity(entity, relationship_name)
         node["children"] = []
@@ -401,7 +513,11 @@ class SchemaExtractor:
                 continue
             for reference in iter_entity_references(value):
                 child_guid = reference.get("guid")
-                if not child_guid or child_guid in seen_children or child_guid in next_ancestors:
+                if (
+                    not child_guid
+                    or child_guid in seen_children
+                    or child_guid in next_ancestors
+                ):
                     continue
                 seen_children.add(child_guid)
                 child = self.get_entity(child_guid)
@@ -422,6 +538,8 @@ class SchemaExtractor:
         return node
 
     def extract_dataset(self, guid: str) -> dict[str, Any]:
+        """Extract one dataset and all reachable schema elements."""
+
         entity = self.get_entity(guid)
         result = self.extract_node(
             entity, relationship_name="dataset", ancestors=frozenset()
@@ -431,6 +549,13 @@ class SchemaExtractor:
 
 
 def flatten_dataset(dataset: dict[str, Any]) -> Iterable[dict[str, Any]]:
+    """Yield normalized CSV rows from a hierarchical dataset result.
+
+    The current schema and table names are carried down the tree so every
+    column row includes its parent context. Power BI models without a separate
+    schema entity leave ``schemaName`` empty.
+    """
+
     dataset_name = dataset.get("name")
     dataset_guid = dataset.get("guid")
 
@@ -439,6 +564,8 @@ def flatten_dataset(dataset: dict[str, Any]) -> Iterable[dict[str, Any]]:
         schema_name: str | None = None,
         table_name: str | None = None,
     ) -> Iterable[dict[str, Any]]:
+        """Walk one subtree while preserving its nearest schema and table."""
+
         kind = node.get("kind")
         if kind == "schema":
             schema_name = node.get("name")
@@ -469,6 +596,8 @@ def flatten_dataset(dataset: dict[str, Any]) -> Iterable[dict[str, Any]]:
 def write_outputs(
     datasets: list[dict[str, Any]], json_path: Path, csv_path: Path
 ) -> None:
+    """Write hierarchical JSON and normalized UTF-8 CSV output files."""
+
     json_path.parent.mkdir(parents=True, exist_ok=True)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     json_path.write_text(
@@ -497,6 +626,8 @@ def write_outputs(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Define and parse command-line arguments."""
+
     parser = argparse.ArgumentParser(
         description=(
             "Export Power BI datasets and their schema/table/column metadata "
@@ -545,6 +676,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the extraction workflow and return a process exit code."""
+
     args = parse_args(argv)
     logging.basicConfig(
         level=logging.INFO if args.verbose else logging.WARNING,
@@ -565,6 +698,7 @@ def main(argv: list[str] | None = None) -> int:
             for result in client.search_entities(dataset_type):
                 guid = result.get("id") or result.get("guid")
                 if guid:
+                    # A dataset may match more than one compatible type query.
                     search_results[guid] = result
 
         extractor = SchemaExtractor(client)
